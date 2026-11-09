@@ -5,65 +5,44 @@ Created on Thu Sep 21 11:44:32 2023
 
 @author: stonneau
 
-Part 1.II - Motion planning under the grasping constraint.
+Part 1.II - motion planning under the grasping constraint.
 
-Overview of the approach (RRT and RRT-Connect from the Motion Planning II
-lecture; the general RRT structure is inspired by the motion planning tutorial,
-but the code below is my own):
-
-II.a  sampleconfiguration : sample a cube placement in a bounded region above
-      the table, then solve an inverse geometry problem (inverse_geometry.py)
-      to obtain a collision free configuration grasping the cube there.
-
-II.b  projectpath : given two grasping configurations q0, q1 and a step,
-      linearly interpolate in configuration space AND in cube space, and
-      project every interpolated configuration back onto the grasping
-      constraint with the IG solver, seeded with the interpolated
-      configuration. Every configuration returned is therefore a grasping
-      pose, collision free and within the joint limits. If one of them cannot
-      be projected (or the projection "jumps" to another IK branch), the
-      function stops and returns the valid part of the path and False.
-
-II.c  computepath : RRT-Connect in the space of grasping configurations
-      (bidirectional trees from q0 and qe, greedy connection). The edges are
-      the projected paths of II.b. The raw solution is then shortened with a
-      few random shortcuts (also validated with projectpath), and finally
-      densified so that consecutive configurations are at most DISCRETISATION
-      apart.
+II.a sampleconfiguration: random cube placement, then inverse geometry.
+II.b projectpath: interpolate q and the cube placement, and project every
+     interpolated q back onto the grasping constraint.
+II.c computepath: RRT-Connect (Motion Planning II lecture; Kuffner & LaValle,
+     ICRA 2000) over grasping configurations, with projectpath as the local
+     steering method, then random shortcutting.
 """
 
 import pinocchio as pin
 import numpy as np
-from numpy.linalg import pinv, norm
+from numpy.linalg import norm
+from scipy.spatial import cKDTree
 
-from config import LEFT_HAND, RIGHT_HAND, LEFT_HOOK
+from config import LEFT_HAND, LEFT_HOOK
 import time
 
-from tools import setcubeplacement, collision, jointlimitsviolated
-from inverse_geometry import computeqgrasppose_fast, computeqgrasppose, isvalid
+from tools import setcubeplacement
+from inverse_geometry import computeqgrasppose_fast, isvalid
 
-# ---------------------------------------------------------------------------
-# Planner parameters
-# ---------------------------------------------------------------------------
-DISCRETISATION   = 0.02   # max distance (in C, rad) between 2 configs of a projected path
-CUBE_STEP        = 0.01   # max distance (m) travelled by the cube between 2 configs
-MAX_JUMP         = 0.15   # a projected config further than this from its predecessor = branch jump
-RRT_DELTA        = 0.10   # max distance (m) the cube moves in one RRT extension
-RRT_MAX_ITER     = 500    # max number of RRT-Connect iterations
-N_SHORTCUTS      = 30     # number of shortcut attempts on the solution path
-CLEARANCE_Z      = 0.35   # how high above the start/goal the cube may be sampled (m)
-MARGIN_XY        = 0.15   # margin around start/goal for the sampled cube positions (m)
-TABLE_Z          = 0.93   # height of the cube on the table (CUBE_PLACEMENT z)
-PATH_CLEARANCE   = 0.02   # (m) clearance from the obstacle required along the path...
-CLEARANCE_RAMP   = 0.15   # ...reduced linearly to 0 when the cube gets within this distance (m) of the start / goal
+DISCRETISATION = 0.02   # (rad) max step in C between 2 configurations of a path
+CUBE_STEP      = 0.01   # (m) max cube displacement between 2 configurations
+MAX_JUMP       = 0.15   # (rad) a larger step means the IK jumped to another branch
+RRT_DELTA      = 0.10   # (m) max cube displacement in one RRT extension
+RRT_MAX_ITER   = 500    # iterations of one RRT-Connect run
+N_ATTEMPTS     = 3      # RRT-Connect runs before reporting a failure
+N_SHORTCUTS    = 30     # shortcut attempts on the solution
+CLEARANCE_Z    = 0.35   # (m) sampling height above the start / goal
+MARGIN_XY      = 0.15   # (m) sampling margin around the start / goal
+TABLE_Z        = 0.93   # (m) height of the cube resting on the table
+PATH_CLEARANCE = 0.02   # (m) clearance from the obstacle along the path,
+CLEARANCE_RAMP = 0.15   # (m) reduced to 0 within this distance of the start / goal
+ROT_WEIGHT     = 0.1    # (m/rad) weight of the rotation in the cube distance
 
-_rng = np.random.default_rng(42)  # fixed seed so that results are reproducible
+_rng = np.random.default_rng(42)
 
-
-# ---------------------------------------------------------------------------
-# computepath has no robot / cube argument (its signature must not be changed),
-# so the planner keeps its own pinocchio models, loaded once, lazily.
-# ---------------------------------------------------------------------------
+# computepath takes no robot / cube argument, so the planner loads its own models
 _ROBOT, _CUBE = None, None
 
 def getmodels():
@@ -73,23 +52,16 @@ def getmodels():
         _ROBOT, _table, _obstacle, _CUBE = setuppinocchio()
     return _ROBOT, _CUBE
 
-
-# start / goal cube placements of the current query (set by computepath),
-# used to compute the required clearance
+# start and goal cube placements of the current query, set by computepath
 _ENDPOINTS = None
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 def requiredclearance(Mcube):
-    '''Clearance (m) required between the obstacle and the robot / cube when
-    the cube is at Mcube. Tested in pybullet: a path that grazes the obstacle
-    is not trackable (the wrist catches it), so PATH_CLEARANCE is required
-    along the path. The start / goal configurations cannot always keep that
-    distance (e.g. for the default target an arm has to pass within a few
-    mm of the obstacle), so the requirement is ramped down to 0 as the cube
-    gets close to its start or goal placement.'''
+    '''Clearance (m) required from the obstacle when the cube is at Mcube.
+    In pybullet, a path that grazes the obstacle makes the wrist catch it, so
+    PATH_CLEARANCE is required; the start and goal poses themselves can be
+    closer (the default goal pose is ~2 mm away), so the requirement is ramped
+    down near them.'''
     if _ENDPOINTS is None:
         return 0.
     d = min(norm(Mcube.translation - M.translation) for M in _ENDPOINTS)
@@ -97,7 +69,7 @@ def requiredclearance(Mcube):
 
 
 def cubeplacementfromq(robot, cube, q):
-    '''Cube placement implied by the left hand of a grasping configuration q:
+    '''Cube placement given by the left hand of a grasping configuration:
     oMcube = oMleft * (cubeMhookL)^-1'''
     pin.framesForwardKinematics(robot.model, robot.data, q)
     oML = robot.data.oMf[robot.model.getFrameId(LEFT_HAND)]
@@ -106,23 +78,21 @@ def cubeplacementfromq(robot, cube, q):
 
 
 def interpolatecube(M0, M1, t):
-    '''Interpolation between 2 cube placements: linear for the translation,
-    geodesic (slerp, via exp/log) for the rotation.'''
+    '''Linear interpolation of the translation, geodesic (exp / log) of the rotation'''
     R = M0.rotation @ pin.exp3(t * pin.log3(M0.rotation.T @ M1.rotation))
     p = (1 - t) * M0.translation + t * M1.translation
     return pin.SE3(R, p)
 
 
-def cubedistance(M0, M1):
-    '''Distance used for the nearest neighbour search: translation distance
-    plus a (small) weight on the rotation angle'''
-    return norm(M0.translation - M1.translation) + 0.1 * norm(pin.log3(M0.rotation.T @ M1.rotation))
+def cubefeature(M):
+    '''Vector used for the nearest neighbour search: [position, ROT_WEIGHT * log3(R)].
+    The Euclidean distance between features is the distance between cube placements.'''
+    return np.concatenate([M.translation, ROT_WEIGHT * pin.log3(M.rotation)])
 
 
 def samplingbounds(cubeplacementq0, cubeplacementqgoal):
-    '''Box in which cube positions are sampled. I bound the problem (allowed by
-    the instructions) to the region spanned by the start and the goal, with a
-    margin, from the table height up to CLEARANCE_Z above the higher of the 2.'''
+    '''Box in which cube positions are sampled: the region spanned by the start
+    and goal, with a margin, from the table up to CLEARANCE_Z above them.'''
     p0, p1 = cubeplacementq0.translation, cubeplacementqgoal.translation
     lo = np.minimum(p0, p1) - np.array([MARGIN_XY, MARGIN_XY, 0.])
     hi = np.maximum(p0, p1) + np.array([MARGIN_XY, MARGIN_XY, CLEARANCE_Z])
@@ -130,13 +100,10 @@ def samplingbounds(cubeplacementq0, cubeplacementqgoal):
     return lo, hi
 
 
-# ---------------------------------------------------------------------------
-# II.a  Sampling configurations
-# ---------------------------------------------------------------------------
+# II.a sampling configurations
 def samplecubeplacement(cubeplacementq0, cubeplacementqgoal):
-    '''Random cube placement: position uniform in the sampling box, orientation
-    on the geodesic between the start and goal orientations (the cube is never
-    tilted, which is what we want when carrying it).'''
+    '''Position uniform in the sampling box, orientation between the start and
+    goal orientations (the cube is never tilted).'''
     lo, hi = samplingbounds(cubeplacementq0, cubeplacementqgoal)
     p = _rng.uniform(lo, hi)
     M = interpolatecube(cubeplacementq0, cubeplacementqgoal, _rng.uniform())
@@ -144,8 +111,7 @@ def samplecubeplacement(cubeplacementq0, cubeplacementqgoal):
 
 
 def sampleconfiguration(robot, cube, qseed, cubeplacementq0, cubeplacementqgoal, maxtrials=20):
-    '''Sample a random cube placement and return a valid grasping configuration
-    for it (collision free, within joint limits), the placement and a flag.'''
+    '''Random valid grasping configuration: returns (q, cube placement, success)'''
     for _ in range(maxtrials):
         M = samplecubeplacement(cubeplacementq0, cubeplacementqgoal)
         q, ok = computeqgrasppose_fast(robot, qseed, cube, M, requiredclearance(M))
@@ -154,19 +120,12 @@ def sampleconfiguration(robot, cube, qseed, cubeplacementq0, cubeplacementqgoal,
     return qseed, None, False
 
 
-# ---------------------------------------------------------------------------
-# II.b  Path projection
-# ---------------------------------------------------------------------------
+# II.b path projection
 def projectpath(robot, cube, q0, q1, cube0=None, cube1=None, discretisationstep=DISCRETISATION):
-    '''Interpolated path from q0 to q1 such that every configuration grasps the
-    cube. Returns (path, success). path always starts with q0. On failure, path
-    is the valid part of the path (from q0 to the last valid configuration).
-
-    Each intermediate configuration is obtained by linearly interpolating q
-    AND the cube placement, and then projecting the interpolated q onto the
-    grasping constraint (IG seeded with the interpolated q). Seeding with the
-    linear interpolation (and not with the previous configuration) keeps the
-    projected path close to the straight line and makes it end exactly at q1.'''
+    '''Path from q0 to q1 in which every configuration grasps the cube.
+    Returns (path, success); on failure, path is the valid part from q0.
+    Each step interpolates q and the cube placement, then projects the
+    interpolated q onto the grasping constraint (IK seeded with it).'''
     if cube0 is None: cube0 = cubeplacementfromq(robot, cube, q0)
     if cube1 is None: cube1 = cubeplacementfromq(robot, cube, q1)
 
@@ -191,22 +150,25 @@ def projectpath(robot, cube, q0, q1, cube0=None, cube1=None, discretisationstep=
     return path, True
 
 
-# ---------------------------------------------------------------------------
-# II.c  RRT-Connect
-# ---------------------------------------------------------------------------
+# II.c RRT-Connect
 class Tree:
-    '''A tree of grasping configurations. Each node stores the configuration,
-    the cube placement and the index of its parent.'''
+    '''Grasping configurations with their cube placement and parent index.
+    Nearest neighbour queries use a k-d tree (scipy cKDTree) on cubefeature,
+    rebuilt when nodes have been added since the last query.'''
     def __init__(self, q, Mcube):
         self.q, self.cube, self.parent = [q], [Mcube], [None]
+        self.features = [cubefeature(Mcube)]
+        self.kdtree, self.kdsize = None, 0
 
     def add(self, q, Mcube, parent):
         self.q.append(q); self.cube.append(Mcube); self.parent.append(parent)
+        self.features.append(cubefeature(Mcube))
         return len(self.q) - 1
 
     def nearest(self, Mcube):
-        d = [cubedistance(Mcube, M) for M in self.cube]
-        return int(np.argmin(d))
+        if self.kdsize != len(self.features):
+            self.kdtree, self.kdsize = cKDTree(np.array(self.features)), len(self.features)
+        return int(self.kdtree.query(cubefeature(Mcube))[1])
 
     def branch(self, idx):
         '''configurations from the root to node idx'''
@@ -217,7 +179,7 @@ class Tree:
 
 
 def steer(Mnear, Mrand, delta=RRT_DELTA):
-    '''Cube placement at most delta (m) away from Mnear, towards Mrand'''
+    '''Cube placement at most delta (m) from Mnear, towards Mrand'''
     d = norm(Mrand.translation - Mnear.translation)
     if d <= delta:
         return Mrand
@@ -225,8 +187,7 @@ def steer(Mnear, Mrand, delta=RRT_DELTA):
 
 
 def extend(robot, cube, tree, Mtarget):
-    '''One RRT extension of tree towards the cube placement Mtarget.
-    Returns (index of the new node or None, reached Mtarget?)'''
+    '''Extend tree towards Mtarget: returns (new node index or None, Mtarget reached)'''
     inear = tree.nearest(Mtarget)
     qnear, Mnear = tree.q[inear], tree.cube[inear]
     Mnew = steer(Mnear, Mtarget)
@@ -241,9 +202,8 @@ def extend(robot, cube, tree, Mtarget):
 
 
 def connect(robot, cube, tree, Mtarget, qtarget):
-    '''Greedy RRT-Connect step: extend tree towards Mtarget until it is reached
-    or blocked. When the cube placement is reached, the last node is linked to
-    qtarget (the node of the other tree) with a projected path.'''
+    '''Extend tree towards Mtarget until it is reached or blocked, then link the
+    last node to qtarget. Returns the index of that node, or None.'''
     while True:
         inew, reached = extend(robot, cube, tree, Mtarget)
         if inew is None:
@@ -254,10 +214,7 @@ def connect(robot, cube, tree, Mtarget, qtarget):
 
 
 def rrtconnect(robot, cube, qinit, qgoal, cubeplacementq0, cubeplacementqgoal, maxiter=RRT_MAX_ITER):
-    '''Bidirectional RRT (RRT-Connect, Kuffner & LaValle 2000) over grasping
-    configurations. Returns the list of node configurations from qinit to
-    qgoal, or None.'''
-    # trivial case: the direct projected path is valid
+    '''Node configurations from qinit to qgoal, or None'''
     _, ok = projectpath(robot, cube, qinit, qgoal, cubeplacementq0, cubeplacementqgoal)
     if ok:
         return [qinit, qgoal]
@@ -281,8 +238,7 @@ def rrtconnect(robot, cube, qinit, qgoal, cubeplacementq0, cubeplacementqgoal, m
 
 
 def shortcut(robot, cube, nodes, ntrials=N_SHORTCUTS):
-    '''Random shortcutting: try to replace the part of the path between 2
-    random nodes by a direct projected path. Shortens the (jagged) RRT path.'''
+    '''Replace the part between 2 random nodes by a direct projected path when valid'''
     nodes = list(nodes)
     for _ in range(ntrials):
         if len(nodes) <= 2:
@@ -297,8 +253,7 @@ def shortcut(robot, cube, nodes, ntrials=N_SHORTCUTS):
 
 
 def densify(robot, cube, nodes):
-    '''Concatenate the projected paths between consecutive nodes so that the
-    final path is a dense list of grasping configurations.'''
+    '''Concatenate the projected paths between consecutive nodes'''
     path = [nodes[0]]
     for qa, qb in zip(nodes[:-1], nodes[1:]):
         seg, ok = projectpath(robot, cube, qa, qb)
@@ -310,17 +265,23 @@ def densify(robot, cube, nodes):
 #returns a collision free path from qinit to qgoal under grasping constraints
 #the path is expressed as a list of configurations
 def computepath(qinit,qgoal,cubeplacementq0, cubeplacementqgoal):
+    '''If no path is found after N_ATTEMPTS runs, prints an error and returns
+    [qinit, qgoal], which is not a valid path.'''
     global _ENDPOINTS
     robot, cube = getmodels()
     _ENDPOINTS = (cubeplacementq0, cubeplacementqgoal)
     t0 = time.time()
-    nodes = rrtconnect(robot, cube, qinit, qgoal, cubeplacementq0, cubeplacementqgoal)
+    for attempt in range(N_ATTEMPTS):
+        nodes = rrtconnect(robot, cube, qinit, qgoal, cubeplacementq0, cubeplacementqgoal)
+        if nodes is not None:
+            break
+        print("computepath: attempt %d failed, retrying" % (attempt + 1))
     if nodes is None:
-        print("computepath: no path found, returning [qinit, qgoal]")
+        print("computepath: ERROR, no path found, returning [qinit, qgoal]")
         return [qinit, qgoal]
     nodes = shortcut(robot, cube, nodes)
     path = densify(robot, cube, nodes)
-    print("computepath: %d nodes, %d configurations, %.1f s" % (len(nodes), len(path), time.time() - t0))
+    print("computepath: %d configurations, %.1f s" % (len(path), time.time() - t0))
     return path
 
 

@@ -5,67 +5,55 @@ Created on Wed Sep  6 15:32:51 2023
 
 @author: stonneau
 
-Part 2.II - Torque control law.
+Part 2.II - torque control.
 
-Inverse dynamics (computed torque) control to track the reference trajectory
-q_ref(t), plus a grasping force applied by both hands on the cube, as
-recommended in the instructions:
+Inverse dynamics control (pin.crba, pin.nle, hint in the instructions) tracking
+the reference trajectory, plus a squeezing force applied on the cube by both
+hands through the hand Jacobians, as recommended in the instructions:
 
-    ddq_des = ddq_ref + Kp (q_ref - q) + Kv (vq_ref - vq)          (PD + feedforward)
-    tau     = M(q) ddq_des + h(q, vq)                               (inverse dynamics)
-            + J_L(q)^T f_L + J_R(q)^T f_R                           (grasping force)
+    aq_des = aq_ref + Kp (q_ref - q) + Kv (vq_ref - vq)
+    tau    = M(q) aq_des + h(q, vq) + J_L^T f_L + J_R^T f_R
 
-M is the joint space mass matrix (pin.crba) and h the nonlinear effects
-(Coriolis, centrifugal and gravity: pin.nle). J_L, J_R are the linear parts
-of the hand jacobians expressed in the world frame, and f_L = -f_R is a force
-of magnitude GRASP_FORCE pushing each hand towards the other one, i.e.
-squeezing the cube. Because the inverse dynamics model does not know about
-the cube, this force is not compensated: it presses the hands on the cube
-faces and naturally absorbs the small alignment errors between the hands and
-the cube, and the friction then carries the cube (mass 0.14 kg, friction 1.0,
-so any force above ~0.7 N per hand would hold it; I use a margin).
+The squeezing force is regulated with feedback on the contact normal forces
+measured in pybullet (getContactPoints): integral action on the error between
+the desired and the measured force.
 """
 
 import numpy as np
 import pinocchio as pin
 
 from bezier import Bezier
-from config import LEFT_HAND, RIGHT_HAND
-
+from config import LEFT_HAND, RIGHT_HAND, DT
+    
 # in my solution these gains were good enough for all joints but you might want to tune this.
 Kp = 300.               # proportional gain (P of PD)
 Kv = 2 * np.sqrt(Kp)   # derivative gain (D of PD)
 
-GRASP_FORCE  = 30.      # (N) squeezing force applied by each hand on the cube
-GRASP_RAMP   = 0.3      # (s) the grasping force is ramped up over this duration
+GRASP_FORCE = 30.    # (N) desired squeezing force per hand
+GRASP_RAMP  = 0.3    # (s) ramp-up time of the grasp
+FORCE_KI    = 20.    # (1/s) integral gain of the force feedback
+FORCE_MAX   = 60.    # (N) bounds of the commanded squeezing force
+RECORD_VIDEO = False # save the pybullet GUI to demo.mp4 (needs ffmpeg)
 
 
 def matchsimulatormodel(robot):
-    '''Make the pinocchio dynamic model consistent with pybullet.
-    The effector links LARM_EFF_Link / RARM_EFF_Link have no <inertial> tag
-    in the urdf. Pinocchio then gives them a zero mass, but pybullet gives
-    them a mass of 1 kg (see the pybullet warning "No inertial data for link,
-    using mass=1" when the robot is loaded). Checked with
-    pybullet.getDynamicsInfo: mass 1.0, local inertia diagonal (0, 0, 0), i.e.
-    a 1 kg point mass at the effector frame.
-    Without this correction the inverse dynamics model misses 1 kg at each
-    wrist and the arms sag (steady tracking error ~0.2 rad).
-    Done once per robot (the flag avoids adding the mass twice).'''
+    '''The effector links (LARM_EFF_Link, RARM_EFF_Link) have no <inertial> tag
+    in the urdf: pinocchio gives them no mass, pybullet a 1 kg point mass
+    (pybullet warning at load time, checked with getDynamicsInfo). The point
+    masses are added to the pinocchio model, otherwise the arms sag by ~0.2 rad.'''
     if getattr(robot, '_simmodelmatched', False):
         return
     m = robot.model
     for name in (LEFT_HAND, RIGHT_HAND):
         frame = m.frames[m.getFrameId(name)]
-        Ilink = pin.Inertia(1., np.zeros(3), np.zeros((3, 3)))  # point mass, as in pybullet
-        m.inertias[frame.parent] += frame.placement.act(Ilink)
+        m.inertias[frame.parent] += frame.placement.act(pin.Inertia(1., np.zeros(3), np.zeros((3, 3))))
     robot.data = m.createData()
     robot._simmodelmatched = True
 
 
 def cubemass(sim):
-    '''Total mass of the cube in pybullet (base + hook links). The hook links
-    of cube_small.urdf have no <inertial> tag either, so pybullet gives them
-    1 kg each: the simulated cube weighs 2.14 kg, not 0.14 kg.'''
+    '''Mass of the cube in pybullet. Its hook links have no <inertial> tag
+    either and get 1 kg each: 2.14 kg in total.'''
     if not hasattr(sim, '_cubemass'):
         p = sim.p
         sim._cubemass = p.getDynamicsInfo(sim.cubeId, -1)[0] + sum(
@@ -73,20 +61,35 @@ def cubemass(sim):
     return sim._cubemass
 
 
+def measuredsqueeze(sim):
+    '''Mean over both hands of the contact normal force between the hand and
+    the cube (N), from the last simulation step.'''
+    p = sim.p
+    if not hasattr(sim, '_armlinks'):
+        name = lambda i: p.getJointInfo(sim.robot, i)[12].decode()
+        sim._armlinks = {side: {i for i in range(p.getNumJoints(sim.robot)) if name(i).startswith(side)}
+                         for side in ('LARM', 'RARM')}
+    contacts = p.getContactPoints(sim.robot, sim.cubeId)
+    forces = [sum(c[9] for c in contacts if c[3] in sim._armlinks[side]) for side in ('LARM', 'RARM')]
+    return 0.5 * sum(forces)
+
+
+def squeezecommand(sim, fdes):
+    '''Commanded squeezing force: fdes + FORCE_KI * integral(fdes - measured)'''
+    sim._forceintegral = getattr(sim, '_forceintegral', 0.) + (fdes - measuredsqueeze(sim)) * DT
+    sim._forceintegral = float(np.clip(sim._forceintegral, -fdes / FORCE_KI, FORCE_MAX / FORCE_KI))
+    return float(np.clip(fdes + FORCE_KI * sim._forceintegral, 0., FORCE_MAX))
+
+
 def graspforcetorques(robot, q, force, load=0.):
-    '''Joint torques J_L^T f_L + J_R^T f_R where
-      - f_L = -f_R has magnitude force and points from the left to the right
-        hand: the hands squeeze the cube
-      - plus, on each hand, an upward force load/2: feedforward compensation of
-        the weight of the cube (load = m_cube * g), which the inverse dynamics
-        model of the robot does not include.'''
+    '''J_L^T f_L + J_R^T f_R: a squeeze of magnitude force along the line
+    between the hands, plus an upward force load / 2 on each hand compensating
+    the weight of the cube, which is not in the robot model.'''
     pin.computeJointJacobians(robot.model, robot.data, q)
     pin.framesForwardKinematics(robot.model, robot.data, q)
     idL = robot.model.getFrameId(LEFT_HAND)
     idR = robot.model.getFrameId(RIGHT_HAND)
-    pL = robot.data.oMf[idL].translation
-    pR = robot.data.oMf[idR].translation
-    u = pR - pL
+    u = robot.data.oMf[idR].translation - robot.data.oMf[idL].translation
     u = u / np.linalg.norm(u)
     JL = pin.getFrameJacobian(robot.model, robot.data, idL, pin.LOCAL_WORLD_ALIGNED)[:3]
     JR = pin.getFrameJacobian(robot.model, robot.data, idR, pin.LOCAL_WORLD_ALIGNED)[:3]
@@ -100,19 +103,14 @@ def controllaw(sim, robot, trajs, tcurrent, cube):
     q_of_t, vq_of_t, vvq_of_t = trajs[:3]
     qref, vqref, aqref = q_of_t(tcurrent), vq_of_t(tcurrent), vvq_of_t(tcurrent)
 
-    # desired acceleration: feedforward + PD on the tracking error
     aqdes = aqref + Kp * (qref - q) + Kv * (vqref - vq)
-
-    # inverse dynamics: tau = M(q) aq_des + h(q, vq)
     M = pin.crba(robot.model, robot.data, q)
     h = pin.nle(robot.model, robot.data, q, vq)
     torques = M @ aqdes + h
 
-    # grasping force and cube weight compensation, both ramped up at the start
-    # to avoid a shock on the cube
     ramp = min(1., max(tcurrent, 0.) / GRASP_RAMP)
-    torques += graspforcetorques(robot, q, ramp * GRASP_FORCE, ramp * cubemass(sim) * 9.81)
-
+    force = squeezecommand(sim, ramp * GRASP_FORCE)
+    torques += graspforcetorques(robot, q, force, ramp * cubemass(sim) * 9.81)
     sim.step(list(torques))
 
 if __name__ == "__main__":
@@ -135,28 +133,32 @@ if __name__ == "__main__":
     #setting initial configuration
     sim.setqsim(q0)
 
+    # display only: the table and obstacle meshes refer to .mtl files missing
+    # from the repository, rendered black by some OpenGL drivers
+    p = sim.p
+    p.changeVisualShape(sim.tableId, -1, rgbaColor=[0.85, 0.75, 0.6, 1.])
+    p.changeVisualShape(sim.obstacleId, -1, rgbaColor=[0.8, 0.1, 0.1, 1.])
+    p.changeVisualShape(sim.cubeId, -1, rgbaColor=[0.95, 0.95, 0.95, 1.])
+    targetshape = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.05, 0.05, 0.001], rgbaColor=[0., 0.8, 0., 1.])
+    targetpos = CUBE_PLACEMENT_TARGET.translation - np.array([0., 0., 0.048])
+    p.createMultiBody(baseMass=0., baseVisualShapeIndex=targetshape, basePosition=list(targetpos))
 
-    # Trajectory: level 1 (QP fit of a Bezier curve) with an automatic fallback
-    # to level 0 (quintic time scaling along the path), see trajectory.py.
-    # The simple example below (straight Bezier from q0 to qe, which does not
-    # follow the path) is kept for reference only.
-    def maketraj(q0,q1,T):
-        q_of_t = Bezier([q0,q0,q1,q1],t_max=T)
-        vq_of_t = q_of_t.derivative(1)
-        vvq_of_t = vq_of_t.derivative(1)
-        return q_of_t, vq_of_t, vvq_of_t
+    if not (successinit and successend) or len(path) < 3:
+        print("error: no valid grasp configurations or path, the motion will not be valid")
 
-    from trajectory import maketraj as maketrajfrompath
-    q_of_t, vq_of_t, vvq_of_t, total_time = maketrajfrompath(robot, cube, path)
+    from trajectory import maketraj
+    q_of_t, vq_of_t, vvq_of_t, total_time = maketraj(robot, cube, path)
     trajs = (q_of_t, vq_of_t, vvq_of_t)
+
+    if RECORD_VIDEO:
+        p.startStateLogging(p.STATE_LOGGING_VIDEO_MP4, "demo.mp4")
 
     tcur = 0.
 
-    # run the trajectory, then hold the final configuration for 1 s so that
-    # the cube settles at the target
+    # trajectory, then 1 s holding the final configuration
     while tcur < total_time + 1.:
         rununtil(controllaw, DT, sim, robot, trajs, tcur, cube)
         tcur += DT
-
-
-
+    
+    
+    
